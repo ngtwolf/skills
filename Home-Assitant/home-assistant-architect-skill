@@ -1,7 +1,7 @@
 ---
 name: homeassistant-system-architect
 description: Operational skill for agents diagnosing, maintaining, and safely extending a standalone/containerized Home Assistant system. Use for Home Assistant Core health, Docker/container checks, configuration files, YAML automations, scripts, templates, helpers, ZHA, Z-Wave JS, Matter, logs, updates, and repair workflows. This is not a normal live entity-control skill.
-version: 1.0.0
+version: 1.0.1
 ---
 
 # Home Assistant System Architect Skill
@@ -137,37 +137,68 @@ Stop and report if:
 
 ## 4. Discovery workflow
 
-### 4.1 Identify Home Assistant containers
+### 4.1 Identify the Home Assistant Core container first
+
+First locate the actual **Home Assistant Core** container. Do not confuse Home Assistant-adjacent service containers with Home Assistant Core.
+
+Run:
 
 ```sh
 docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
 docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
 ```
 
-Look for images/names such as:
+Likely Home Assistant Core image/name candidates include:
 
 - `ghcr.io/home-assistant/home-assistant`
 - `homeassistant/home-assistant`
-- `homeassistant`
-- `zwave-js-ui`
-- `zwavejs/zwave-js-ui`
-- `home-assistant-libs/python-matter-server`
-- `eclipse-mosquitto`
-- `esphome/esphome`
-- `frigate`
-- `matter-server`
+- container names such as `homeassistant`, `home-assistant`, `ha`, or another local naming convention
 
-If the Home Assistant container is not named `homeassistant`, discover and use the actual name.
+Confirm the Core container before using it as `HA_CONT`. A valid Home Assistant Core container should generally:
 
-Set a local shell variable for examples:
+- run a Home Assistant Core image,
+- expose or serve Home Assistant on port `8123`,
+- have a mounted configuration directory at `/config`,
+- successfully run `python -m homeassistant --version`,
+- and contain Home Assistant logs/config files under `/config`.
+
+Example:
 
 ```sh
-HA_CONT="homeassistant"
+HA_CONT="<discovered-home-assistant-core-container>"
+docker exec "$HA_CONT" python -m homeassistant --version
+docker inspect "$HA_CONT" --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}'
 ```
 
-Replace it with the discovered container name.
+If the Home Assistant Core container is not named `homeassistant`, use the discovered container name. Do not assume the name.
 
-### 4.2 Inspect Home Assistant container
+### 4.2 Identify Home Assistant-adjacent service containers
+
+After identifying Home Assistant Core, look for related service containers that may support integrations or explain system issues. These containers are **not** Home Assistant Core.
+
+| Container / image pattern | Role |
+|---|---|
+| `zwave-js-ui`, `zwavejs/zwave-js-ui` | Z-Wave controller backend used by the Home Assistant Z-Wave JS integration |
+| `home-assistant-libs/python-matter-server`, `matter-server`, `python-matter-server` | Matter backend used by the Home Assistant Matter integration |
+| `eclipse-mosquitto`, `mosquitto` | MQTT broker used by MQTT devices, sensors, Frigate, Zigbee2MQTT, and other integrations |
+| `esphome/esphome`, `esphome` | ESPHome dashboard/build/update service |
+| `frigate` | NVR/camera/object-detection service, often integrated with Home Assistant through MQTT/API |
+| `zigbee2mqtt` | Zigbee controller service if the system uses Zigbee2MQTT instead of ZHA |
+| `otbr`, `openthread-border-router` | Thread border router service, if Matter/Thread is deployed separately |
+
+Use adjacent containers only when relevant to the issue:
+
+- If Z-Wave entities are unavailable, inspect Z-Wave JS UI.
+- If Matter devices fail, inspect Matter Server, IPv6, mDNS, and Thread/OTBR.
+- If MQTT entities are unavailable, inspect Mosquitto or the configured MQTT broker.
+- If camera/object sensors are failing, inspect Frigate and MQTT.
+- If ESPHome devices or firmware builds are failing, inspect ESPHome.
+- If Zigbee devices use ZHA, inspect Home Assistant Core and its USB serial mapping.
+- If Zigbee devices use Zigbee2MQTT, inspect the Zigbee2MQTT container and MQTT broker.
+
+Do not set `HA_CONT` to Frigate, Mosquitto, ESPHome, Z-Wave JS UI, Matter Server, or any other adjacent service container.
+
+### 4.3 Inspect Home Assistant Core container
 
 ```sh
 docker inspect "$HA_CONT" --format '
@@ -189,7 +220,7 @@ docker inspect "$HA_CONT" --format '{{range .Mounts}}{{println .Source "->" .Des
 
 The mount whose destination is `/config` is the host-side Home Assistant configuration directory.
 
-### 4.3 Discover compose files carefully
+### 4.4 Discover compose files carefully
 
 Prefer repository/inventory docs. If needed, search likely locations, not the entire filesystem:
 
