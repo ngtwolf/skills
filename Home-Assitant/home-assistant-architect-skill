@@ -1,0 +1,1383 @@
+---
+name: homeassistant-system-architect
+description: Operational skill for agents diagnosing, maintaining, and safely extending a standalone/containerized Home Assistant system. Use for Home Assistant Core health, Docker/container checks, configuration files, YAML automations, scripts, templates, helpers, ZHA, Z-Wave JS, Matter, logs, updates, and repair workflows. This is not a normal live entity-control skill.
+version: 1.0.0
+---
+
+# Home Assistant System Architect Skill
+
+## 1. Purpose
+
+Use this skill when acting as a Home Assistant system architect: diagnosing the Home Assistant platform itself, maintaining a standalone/containerized Home Assistant deployment, editing configuration, building automations/routines, and validating/reloading changes safely.
+
+This is **not** the normal Home Assistant user-control skill. Do not use this skill merely to turn on lights, toggle switches, set thermostats, or query a device state unless doing so is part of diagnosis or validation.
+
+This skill is for agents that already have authorized access through one or more of:
+
+- SSH to the Docker host
+- Docker CLI access
+- a mounted Home Assistant config share
+- Home Assistant REST/WebSocket API token
+- local documentation/inventory containing hostnames, paths, container names, and network layout
+
+Do not hard-code user-specific hostnames, IP addresses, tokens, paths, or device names in this skill. Discover them from the agent’s normal environment, repository notes, inventory files, SSH config, compose files, or operator instructions.
+
+---
+
+## 2. Core mental model
+
+Home Assistant can be installed in several ways. This skill is optimized for **Home Assistant Container / standalone Docker**, not Home Assistant OS or Supervised.
+
+### Container install model
+
+In Home Assistant Container:
+
+- Home Assistant Core runs inside a Docker container.
+- There is no Supervisor.
+- There are no Home Assistant OS add-ons.
+- The `ha` CLI and Supervisor API are not the normal management interface.
+- Updates are Docker image/container lifecycle operations.
+- Configuration is mounted into the container as `/config`.
+- Logs exist both in Docker logs and inside the config directory.
+- Z-Wave, Matter, MQTT, Frigate, ESPHome, and other services may be separate containers.
+
+If the system is actually Home Assistant OS or Supervised, stop and switch to the correct operational model. Do not apply Docker-container assumptions blindly.
+
+### Architect stance
+
+The agent should think in layers:
+
+1. **Host layer:** Docker, storage, networking, USB devices, compose files.
+2. **Container layer:** Home Assistant Core process, mounted `/config`, logs, ports.
+3. **Home Assistant core layer:** integrations, states, services/actions, repairs, registries.
+4. **Configuration layer:** YAML, `.storage` JSON, secrets, automations, scripts, templates.
+5. **Radio/controller layer:** ZHA, Z-Wave JS UI, Matter Server, Thread/OTBR, MQTT.
+6. **Routine layer:** automations, scripts, scenes, helpers, template entities, dashboards.
+
+Do not skip layers. A broken automation may be YAML. A broken ZHA network may be a USB mapping. A broken Matter device may be IPv6/mDNS. A failed restart may be a corrupt `.storage` JSON file or broken custom integration.
+
+---
+
+## 3. Safety rules
+
+### Read-only by default
+
+These are normally safe when diagnosing:
+
+- inspect Docker containers and images
+- read compose files
+- read Home Assistant config files
+- read logs
+- run configuration validation
+- list entities/states/services through API
+- inspect `.storage` JSON files
+- inspect device mappings and USB serial paths
+- inspect mounted volumes
+- inspect Z-Wave/Matter/Zigbee container status
+- inspect update posture
+
+### Requires explicit approval
+
+Do not perform these without explicit operator approval:
+
+- restart Home Assistant
+- restart Docker containers
+- stop Home Assistant
+- update images
+- edit YAML
+- edit `.storage`
+- rename entities
+- change device registry or entity registry
+- add/remove integrations
+- include/exclude/re-interview Z-Wave devices
+- reconfigure ZHA radio path
+- commission/remove Matter devices
+- delete databases
+- move custom integrations
+- run migrations
+- delete logs, backups, or recorder DB files
+- change Docker compose files
+- change host USB mappings
+- change network mode, ports, DNS, IPv6, mDNS, or firewall rules
+
+### High-risk changes
+
+These require approval plus rollback plan:
+
+- editing `.storage` manually
+- deleting or moving `home-assistant_v2.db`
+- removing `custom_components`
+- changing ZHA/Z-Wave/Matter controller paths
+- updating Home Assistant Core across major breaking changes
+- changing recorder settings
+- editing entity/device registries
+- rebuilding Docker containers from changed compose files
+- changing MQTT broker details
+- changing secrets
+
+### Hard stops
+
+Stop and report if:
+
+- the Home Assistant install type is unclear
+- the config directory cannot be identified
+- the container name is ambiguous
+- Docker host identity is unclear
+- current backup status is unknown and the proposed change can affect config/data
+- `check_config` fails
+- logs show database corruption
+- logs show `.storage` JSON load errors
+- logs show migration failure
+- the system is mid-update/migration
+- disk is full or near full
+- the requested change would disconnect SSH/API access
+- the requested change touches radio/network infrastructure without a maintenance plan
+
+---
+
+## 4. Discovery workflow
+
+### 4.1 Identify Home Assistant containers
+
+```sh
+docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+```
+
+Look for images/names such as:
+
+- `ghcr.io/home-assistant/home-assistant`
+- `homeassistant/home-assistant`
+- `homeassistant`
+- `zwave-js-ui`
+- `zwavejs/zwave-js-ui`
+- `home-assistant-libs/python-matter-server`
+- `eclipse-mosquitto`
+- `esphome/esphome`
+- `frigate`
+- `matter-server`
+
+If the Home Assistant container is not named `homeassistant`, discover and use the actual name.
+
+Set a local shell variable for examples:
+
+```sh
+HA_CONT="homeassistant"
+```
+
+Replace it with the discovered container name.
+
+### 4.2 Inspect Home Assistant container
+
+```sh
+docker inspect "$HA_CONT" --format '
+Name={{.Name}}
+Image={{.Config.Image}}
+State={{.State.Status}}
+StartedAt={{.State.StartedAt}}
+Restarting={{.State.Restarting}}
+ExitCode={{.State.ExitCode}}
+NetworkMode={{.HostConfig.NetworkMode}}
+'
+```
+
+Inspect mounts:
+
+```sh
+docker inspect "$HA_CONT" --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}'
+```
+
+The mount whose destination is `/config` is the host-side Home Assistant configuration directory.
+
+### 4.3 Discover compose files carefully
+
+Prefer repository/inventory docs. If needed, search likely locations, not the entire filesystem:
+
+```sh
+docker compose ls 2>/dev/null || true
+find /opt /srv /home -maxdepth 5 \( -name 'compose.yaml' -o -name 'compose.yml' -o -name 'docker-compose.yml' -o -name 'docker-compose.yaml' \) 2>/dev/null
+```
+
+Do not modify compose files without approval.
+
+---
+
+## 5. Standard system preflight
+
+Run this before diagnosis or any proposed change.
+
+```sh
+HA_CONT="${HA_CONT:-homeassistant}"
+
+echo "===== HOST ====="
+date
+hostname
+uname -a
+uptime
+df -h
+
+echo "===== DOCKER ====="
+docker version --format '{{.Server.Version}}' 2>/dev/null || docker version
+docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+
+echo "===== HOME ASSISTANT CONTAINER ====="
+docker inspect "$HA_CONT" --format '
+Name={{.Name}}
+Image={{.Config.Image}}
+State={{.State.Status}}
+StartedAt={{.State.StartedAt}}
+Restarting={{.State.Restarting}}
+ExitCode={{.State.ExitCode}}
+NetworkMode={{.HostConfig.NetworkMode}}
+' 2>/dev/null
+
+echo "===== HOME ASSISTANT VERSION ====="
+docker exec "$HA_CONT" python -m homeassistant --version 2>/dev/null || true
+
+echo "===== CONFIG MOUNT ====="
+docker inspect "$HA_CONT" --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}' 2>/dev/null
+
+echo "===== RECENT LOGS ====="
+docker logs --tail=250 "$HA_CONT" 2>&1 | tail -n 250
+```
+
+Interpretation:
+
+- If the container is restarting, inspect logs before changing anything.
+- If disk is full, fix storage before restarting or updating.
+- If `/config` is not mounted or not discoverable, stop and report.
+- If Home Assistant version cannot be read, inspect container status and logs.
+
+---
+
+## 6. Configuration directory map
+
+Inside the container, Home Assistant sees the config directory as:
+
+```text
+/config
+```
+
+Common files and directories:
+
+| Path | Purpose |
+|---|---|
+| `/config/configuration.yaml` | Main YAML entry point |
+| `/config/automations.yaml` | Common YAML automation storage |
+| `/config/scripts.yaml` | Common script storage |
+| `/config/scenes.yaml` | Common scene storage |
+| `/config/secrets.yaml` | Secret references; not encrypted |
+| `/config/home-assistant.log` | Current Home Assistant log file |
+| `/config/home-assistant.log.1` | Rotated log |
+| `/config/home-assistant_v2.db` | Recorder SQLite database |
+| `/config/.storage/` | UI-managed JSON storage and registries |
+| `/config/custom_components/` | HACS/custom integrations |
+| `/config/packages/` | Optional package-based YAML organization |
+| `/config/blueprints/` | Blueprint imports |
+| `/config/python_scripts/` | `python_script` integration scripts |
+| `/config/www/` | Static files exposed under `/local/` |
+| `/config/zigbee.db` | Common ZHA database file, if ZHA is used |
+| `/config/esphome/` | ESPHome configs, if stored under HA config |
+
+Host-side paths differ. Discover the host path from Docker mounts.
+
+---
+
+## 7. File editing rules
+
+### 7.1 Do not round-trip the whole config casually
+
+Home Assistant YAML may use custom tags:
+
+```yaml
+!include
+!include_dir_list
+!include_dir_named
+!include_dir_merge_list
+!include_dir_merge_named
+!secret
+!env_var
+```
+
+A generic YAML parser can strip comments, reorder keys, flatten includes, or break custom tags. Never parse and dump an entire Home Assistant configuration tree unless the tool is known to preserve Home Assistant tags and formatting.
+
+Preferred edit order:
+
+1. Edit the smallest target file.
+2. Prefer append/update of a single automation/script/template block.
+3. Preserve existing include structure.
+4. Preserve comments where possible.
+5. Back up the file.
+6. Validate with Home Assistant before reload/restart.
+
+### 7.2 Backup before mutation
+
+For a single file:
+
+```sh
+cp -a /path/to/file.yaml /path/to/file.yaml.bak.$(date +%Y%m%d-%H%M%S)
+```
+
+For an entire config directory before risky work:
+
+```sh
+tar --exclude='home-assistant.log*' \
+    --exclude='*.db-shm' \
+    --exclude='*.db-wal' \
+    -czf "ha-config-backup-$(date +%Y%m%d-%H%M%S).tgz" \
+    -C "<host_config_dir>" .
+```
+
+If the recorder database matters, stop Home Assistant or use a proper SQLite backup approach before copying it. Copying live SQLite files can produce inconsistent backups.
+
+### 7.3 Use atomic writes when possible
+
+Write to a temporary file, validate syntax, then move into place:
+
+```sh
+cp -a automations.yaml automations.yaml.bak.$(date +%Y%m%d-%H%M%S)
+cp -a automations.yaml automations.yaml.tmp
+# edit automations.yaml.tmp
+mv automations.yaml.tmp automations.yaml
+```
+
+After write, run config validation before reload.
+
+### 7.4 Secrets
+
+- Do not print `secrets.yaml`.
+- Do not resolve `!secret` into plaintext.
+- Do not run validation modes that expose secret values unless explicitly approved.
+- Do not replace `!secret some_key` with the actual value.
+- Remember: `secrets.yaml` centralizes secrets but does not encrypt them.
+
+---
+
+## 8. YAML style for new work
+
+Use modern Home Assistant syntax for newly generated automations/scripts.
+
+### 8.1 Basic automation pattern
+
+Prefer this shape for new automations:
+
+```yaml
+- id: motion_lights_example
+  alias: "Motion lights example"
+  description: "Turns on a light while motion is active."
+  triggers:
+    - trigger: state
+      entity_id: binary_sensor.example_motion
+      to: "on"
+  conditions: []
+  actions:
+    - action: light.turn_on
+      target:
+        entity_id: light.example
+  mode: restart
+```
+
+Notes:
+
+- Use `id` so the automation is stable and traceable.
+- Use `alias` for readability.
+- Use `description` to explain intent.
+- Use `triggers`, `conditions`, and `actions` for new YAML.
+- Existing configs may use singular `trigger`, `condition`, and `action`. Do not mass-convert unless asked.
+- Use `action:` for service/action calls in new YAML. Existing `service:` syntax may still work, but new work should use `action:`.
+- Use `target:` for entities/devices/areas/floors.
+- Use `data:` for parameters.
+
+Correct:
+
+```yaml
+actions:
+  - action: climate.set_temperature
+    target:
+      entity_id: climate.living_room
+    data:
+      temperature: 72
+```
+
+Incorrect:
+
+```yaml
+actions:
+  - action: climate.set_temperature
+    target:
+      entity_id: climate.living_room
+      temperature: 72
+```
+
+### 8.2 Entity IDs over device IDs
+
+Prefer entity IDs:
+
+```yaml
+triggers:
+  - trigger: state
+    entity_id: binary_sensor.hall_motion
+    to: "on"
+```
+
+Avoid device IDs unless there is a clear reason. Device IDs are tied to specific registry entries and can break when hardware is re-paired or replaced. Entity IDs can be intentionally preserved by renaming the new replacement entity to match the old one.
+
+### 8.3 Automation modes
+
+Always choose `mode` intentionally:
+
+| Mode | Use when |
+|---|---|
+| `single` | Default; ignore new trigger while already running |
+| `restart` | Motion/timer loops where newest trigger should reset the sequence |
+| `queued` | Events must run in order, such as notifications or critical actions |
+| `parallel` | Independent actions can safely overlap |
+
+Do not use `parallel` unless overlap is actually safe.
+
+### 8.4 Template entities
+
+Use top-level `template:` for new template entities:
+
+```yaml
+template:
+  - sensor:
+      - name: "Z-Wave Entity Count"
+        unique_id: zwave_entity_count
+        state: "{{ integration_entities('zwave_js') | length }}"
+        icon: mdi:z-wave
+        state_class: measurement
+```
+
+Use `unique_id` where supported so the entity can be managed through the UI.
+
+---
+
+## 9. Configuration validation
+
+In Home Assistant Container, validate from the Docker host:
+
+```sh
+HA_CONT="${HA_CONT:-homeassistant}"
+docker exec "$HA_CONT" python -m homeassistant --script check_config --config /config
+```
+
+Useful variants, if supported by the installed version:
+
+```sh
+docker exec "$HA_CONT" python -m homeassistant --script check_config --config /config --files
+docker exec "$HA_CONT" python -m homeassistant --script check_config --config /config --info automation
+```
+
+Avoid:
+
+```sh
+docker exec "$HA_CONT" python -m homeassistant --script check_config --config /config --secrets
+```
+
+unless explicitly approved, because it may reveal sensitive information.
+
+Interpretation:
+
+- If validation fails, do not reload or restart.
+- Restore the backup or fix the validation error.
+- Remember validation does not prove runtime success. It only proves configuration can be parsed/loaded.
+
+---
+
+## 10. Targeted reloads
+
+Prefer targeted reload over full restart when the changed domain supports it.
+
+### 10.1 Discover available services/actions
+
+Using REST API token from a secure broker:
+
+```sh
+curl -fsS \
+  -H "Authorization: Bearer $HA_TOKEN" \
+  -H "Content-Type: application/json" \
+  http://127.0.0.1:8123/api/services
+```
+
+Do not print or log `$HA_TOKEN`.
+
+### 10.2 Common reload service calls
+
+Use only after `check_config` passes.
+
+```sh
+# Automations
+curl -fsS -X POST \
+  -H "Authorization: Bearer $HA_TOKEN" \
+  -H "Content-Type: application/json" \
+  http://127.0.0.1:8123/api/services/automation/reload \
+  -d '{}'
+
+# Scripts
+curl -fsS -X POST \
+  -H "Authorization: Bearer $HA_TOKEN" \
+  -H "Content-Type: application/json" \
+  http://127.0.0.1:8123/api/services/script/reload \
+  -d '{}'
+
+# Scenes
+curl -fsS -X POST \
+  -H "Authorization: Bearer $HA_TOKEN" \
+  -H "Content-Type: application/json" \
+  http://127.0.0.1:8123/api/services/scene/reload \
+  -d '{}'
+
+# Core config where supported
+curl -fsS -X POST \
+  -H "Authorization: Bearer $HA_TOKEN" \
+  -H "Content-Type: application/json" \
+  http://127.0.0.1:8123/api/services/homeassistant/reload_core_config \
+  -d '{}'
+```
+
+Other reload services may exist depending on enabled integrations, such as:
+
+- `template.reload`
+- `python_script.reload`
+- `group.reload`
+- `input_boolean.reload`
+- `input_number.reload`
+- `input_select.reload`
+- `input_text.reload`
+
+Confirm in `/api/services` before calling.
+
+### 10.3 Restart only when necessary
+
+Restart Home Assistant only when:
+
+- the changed integration requires restart,
+- validation passes,
+- backup exists,
+- operator approved the restart,
+- and logs/update state do not indicate a dangerous condition.
+
+REST restart action:
+
+```sh
+curl -fsS -X POST \
+  -H "Authorization: Bearer $HA_TOKEN" \
+  -H "Content-Type: application/json" \
+  http://127.0.0.1:8123/api/services/homeassistant/restart \
+  -d '{}'
+```
+
+Docker restart is more blunt:
+
+```sh
+docker restart "$HA_CONT"
+```
+
+Prefer graceful Home Assistant restart via API when the API is healthy. Use Docker restart only when the HA process/API is unresponsive and operator approves.
+
+---
+
+## 11. Logs and troubleshooting
+
+### 11.1 Docker logs
+
+```sh
+docker logs --tail=300 "$HA_CONT"
+docker logs --since=1h "$HA_CONT"
+docker logs -f --tail=200 "$HA_CONT"
+```
+
+### 11.2 Home Assistant log files
+
+```sh
+docker exec "$HA_CONT" sh -lc 'ls -lh /config/home-assistant.log* 2>/dev/null'
+docker exec "$HA_CONT" sh -lc 'tail -n 300 /config/home-assistant.log 2>/dev/null'
+```
+
+### 11.3 Error-focused log scan
+
+```sh
+docker logs --tail=1000 "$HA_CONT" 2>&1 | grep -iE 'error|exception|traceback|failed|invalid|corrupt|malformed|migration|repair|warning' | tail -n 200
+```
+
+Common log domains to search:
+
+```sh
+grep -iE 'custom_components|hacs|recorder|sqlite|zha|zigpy|zwave|matter|thread|mqtt|template|automation|script|yaml|storage' /config/home-assistant.log
+```
+
+---
+
+## 12. API diagnostics
+
+Use the REST API only with a token from a secure credential broker.
+
+### 12.1 Basic health/config
+
+```sh
+curl -fsS -H "Authorization: Bearer $HA_TOKEN" http://127.0.0.1:8123/api/
+curl -fsS -H "Authorization: Bearer $HA_TOKEN" http://127.0.0.1:8123/api/config
+```
+
+### 12.2 States and services
+
+```sh
+curl -fsS -H "Authorization: Bearer $HA_TOKEN" http://127.0.0.1:8123/api/states
+curl -fsS -H "Authorization: Bearer $HA_TOKEN" http://127.0.0.1:8123/api/services
+```
+
+For large systems, do not paste full API output into chat. Filter locally with `jq` if available.
+
+Examples:
+
+```sh
+curl -fsS -H "Authorization: Bearer $HA_TOKEN" http://127.0.0.1:8123/api/states \
+  | jq -r '.[] | [.entity_id, .state] | @tsv'
+```
+
+### 12.3 Test action carefully
+
+Only call live actions when requested or needed for validation.
+
+```sh
+curl -fsS -X POST \
+  -H "Authorization: Bearer $HA_TOKEN" \
+  -H "Content-Type: application/json" \
+  http://127.0.0.1:8123/api/services/persistent_notification/create \
+  -d '{"title":"Agent test","message":"Home Assistant API test succeeded."}'
+```
+
+Use harmless tests first. Do not toggle real lights, locks, alarms, garage doors, valves, thermostats, or appliances without approval.
+
+---
+
+## 13. `.storage` JSON rules
+
+The `.storage` directory contains UI-managed JSON files. Common files include:
+
+| File | Purpose |
+|---|---|
+| `.storage/core.entity_registry` | Entity registry |
+| `.storage/core.device_registry` | Device registry |
+| `.storage/core.area_registry` | Areas |
+| `.storage/core.config_entries` | Integration config entries |
+| `.storage/auth` | Auth data |
+| `.storage/lovelace*` | Dashboard storage |
+| `.storage/automation` or YAML refs | UI metadata varies by version/config |
+
+Rules:
+
+- Prefer UI/API over manual edits.
+- Read-only inspection is okay.
+- Manual edit is high risk.
+- Stop Home Assistant before editing `.storage`.
+- Back up the file and whole `.storage` directory.
+- Validate JSON before restart.
+- Never edit auth files unless doing a documented recovery procedure.
+- Never change IDs casually.
+- Expect Home Assistant to overwrite files if edited while running.
+
+Read-only JSON validation:
+
+```sh
+docker exec "$HA_CONT" sh -lc '
+for f in /config/.storage/*; do
+  [ -f "$f" ] || continue
+  python -m json.tool "$f" >/dev/null 2>&1 || echo "INVALID_JSON $f"
+done
+'
+```
+
+---
+
+## 14. Recorder database health
+
+The recorder database is usually:
+
+```text
+/config/home-assistant_v2.db
+```
+
+Symptoms of database trouble:
+
+- startup hangs
+- recorder errors
+- SQLite malformed/corrupt messages
+- history unavailable
+- high disk I/O
+- huge database file
+- `.db-wal` or `.db-shm` abnormal growth
+
+Read-only checks:
+
+```sh
+docker exec "$HA_CONT" sh -lc 'ls -lh /config/home-assistant_v2.db* 2>/dev/null'
+docker logs --tail=1000 "$HA_CONT" 2>&1 | grep -iE 'recorder|sqlite|database|malformed|corrupt|locked' | tail -n 200
+```
+
+If `sqlite3` is available:
+
+```sh
+docker exec "$HA_CONT" sh -lc 'command -v sqlite3 >/dev/null 2>&1 && sqlite3 /config/home-assistant_v2.db "PRAGMA integrity_check;"'
+```
+
+Do not delete or move the recorder DB without approval. If approved, common emergency recovery is to stop Home Assistant, move the DB aside with a timestamp, restart, and accept loss of history/statistics continuity.
+
+Example proposal only:
+
+```sh
+docker stop "$HA_CONT"
+mv /path/to/config/home-assistant_v2.db /path/to/config/home-assistant_v2.db.bad.$(date +%Y%m%d-%H%M%S)
+docker start "$HA_CONT"
+```
+
+---
+
+## 15. Updates
+
+### 15.1 Home Assistant Container update model
+
+For Docker Compose, the common update pattern is:
+
+```sh
+docker compose pull homeassistant
+docker compose up -d homeassistant
+```
+
+For plain Docker, the pattern is to pull the new image and recreate the container with the same settings. Do not improvise recreate commands from memory; inspect the current compose file or deployment docs.
+
+### 15.2 Pre-update checklist
+
+Before updating:
+
+1. Confirm install type.
+2. Read release notes/breaking changes if version jump is meaningful.
+3. Confirm backup exists.
+4. Record current version.
+5. Record current image.
+6. Run `check_config`.
+7. Check disk space.
+8. Check custom integrations/HACS posture.
+9. Confirm maintenance window.
+10. Confirm rollback path.
+
+Commands:
+
+```sh
+docker exec "$HA_CONT" python -m homeassistant --version
+docker inspect "$HA_CONT" --format '{{.Config.Image}} {{.Image}}'
+docker exec "$HA_CONT" python -m homeassistant --script check_config --config /config
+df -h
+```
+
+### 15.3 Post-update validation
+
+```sh
+docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+docker logs --tail=300 "$HA_CONT"
+docker exec "$HA_CONT" python -m homeassistant --version
+```
+
+Then verify:
+
+- Web UI loads.
+- `/api/` responds.
+- no migration errors.
+- no custom integration tracebacks.
+- automations loaded.
+- ZHA/Z-Wave/Matter/MQTT integrations are connected.
+- critical entities are available.
+
+---
+
+## 16. Custom integrations and HACS
+
+Custom integrations live under:
+
+```text
+/config/custom_components/
+```
+
+Read-only inspection:
+
+```sh
+docker exec "$HA_CONT" sh -lc 'find /config/custom_components -maxdepth 2 -type f -name manifest.json -print 2>/dev/null'
+docker logs --tail=1000 "$HA_CONT" 2>&1 | grep -iE 'custom_components|hacs|integration|manifest|deprecated|not tested' | tail -n 200
+```
+
+Rules:
+
+- Custom integrations are a common cause of startup failures after HA updates.
+- Do not delete them casually.
+- If a custom integration blocks startup, propose moving the specific integration directory aside while HA is stopped.
+- Keep a rollback path.
+
+Example proposal only:
+
+```sh
+docker stop "$HA_CONT"
+mv /path/to/config/custom_components/problem_integration /path/to/config/custom_components/problem_integration.disabled.$(date +%Y%m%d-%H%M%S)
+docker start "$HA_CONT"
+```
+
+---
+
+## 17. ZHA / Zigbee
+
+ZHA usually runs inside Home Assistant Core and talks directly to a USB serial coordinator.
+
+Key principles:
+
+- Use persistent USB paths under `/dev/serial/by-id/`.
+- Avoid `/dev/ttyUSB0` or `/dev/ttyACM0` unless there is no better option.
+- Verify the Docker container has the serial device mapped.
+- ZHA may maintain files such as `zigbee.db` under `/config`.
+- Do not delete ZHA databases or reconfigure the radio without approval.
+
+Host checks:
+
+```sh
+ls -l /dev/serial/by-id/ 2>/dev/null
+dmesg | grep -iE 'ttyUSB|ttyACM|usb|cp210|ch34|silabs|zigbee|zbt' | tail -n 100
+docker inspect "$HA_CONT" --format '{{json .HostConfig.Devices}}'
+```
+
+Home Assistant log checks:
+
+```sh
+docker logs --tail=1000 "$HA_CONT" 2>&1 | grep -iE 'zha|zigpy|bellows|ezsp|znp|deconz|serial|coordinator' | tail -n 200
+```
+
+Common issues:
+
+- USB path changed
+- coordinator not passed into container
+- permissions on serial device
+- radio firmware mismatch
+- Zigbee channel interference
+- database lock/corruption
+- integration stuck after restart
+- unstable USB extension/cable/power
+
+Do not re-pair devices as a first fix.
+
+---
+
+## 18. Z-Wave JS / Z-Wave JS UI
+
+Z-Wave is usually separated into:
+
+1. Z-Wave JS UI container/server
+2. Home Assistant Z-Wave integration connecting to it over WebSocket
+
+Common ports:
+
+- Z-Wave JS UI web interface: often `8091`
+- Z-Wave JS WebSocket server: often `3000`
+
+Discovery:
+
+```sh
+docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' | grep -i zwave || true
+docker logs --tail=300 zwave-js-ui 2>&1
+```
+
+If the container name differs, discover it first.
+
+Checks:
+
+```sh
+docker inspect "<zwave_container>" --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}'
+docker inspect "<zwave_container>" --format '{{json .HostConfig.Devices}}'
+ls -l /dev/serial/by-id/ 2>/dev/null
+```
+
+Home Assistant logs:
+
+```sh
+docker logs --tail=1000 "$HA_CONT" 2>&1 | grep -iE 'zwave|zwave_js|zwave_js_server|websocket' | tail -n 200
+```
+
+Rules:
+
+- Do not include/exclude devices without approval.
+- Do not change controller path without approval.
+- Do not wipe Z-Wave JS UI store.
+- Do not disable security keys.
+- Back up Z-Wave controller NVM through supported tooling/UI before major controller work.
+- If HA cannot connect, check the WebSocket URL, container network, port exposure, and Z-Wave JS UI WS Server setting.
+
+---
+
+## 19. Matter / Thread / OTBR
+
+Matter commonly depends on a separate Matter Server and proper IPv6/mDNS/Thread networking.
+
+Common Matter Server WebSocket pattern:
+
+```text
+ws://<matter-server-host>:5580/ws
+```
+
+Discovery:
+
+```sh
+docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' | grep -i matter || true
+docker logs --tail=300 "<matter_container>" 2>&1
+```
+
+Home Assistant logs:
+
+```sh
+docker logs --tail=1000 "$HA_CONT" 2>&1 | grep -iE 'matter|thread|otbr|border router|mdns|zeroconf|ipv6' | tail -n 250
+```
+
+Network checks:
+
+```sh
+ip -6 addr show 2>/dev/null || true
+ip -6 route show 2>/dev/null || true
+docker network ls
+docker inspect "<matter_container>" --format '{{.HostConfig.NetworkMode}}'
+```
+
+Rules:
+
+- Do not disable IPv6 casually.
+- Do not change Docker network mode casually.
+- Do not reset Matter fabric without approval.
+- Do not remove Matter integration/config entries manually unless following a documented recovery.
+- Matter commissioning/removal is an operator-approved action, not a background fix.
+
+---
+
+## 20. MQTT
+
+If MQTT is part of the architecture, it is often a separate broker container such as Mosquitto.
+
+Discovery:
+
+```sh
+docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' | grep -iE 'mqtt|mosquitto' || true
+docker logs --tail=300 "<mqtt_container>" 2>&1
+```
+
+Home Assistant logs:
+
+```sh
+docker logs --tail=1000 "$HA_CONT" 2>&1 | grep -iE 'mqtt|mosquitto' | tail -n 200
+```
+
+Rules:
+
+- Do not print broker usernames/passwords.
+- Do not delete retained messages unless approved.
+- Do not change broker hostname/port without understanding every dependent integration.
+
+---
+
+## 21. Building automations and routines
+
+### 21.1 Routine design workflow
+
+Before writing automation YAML:
+
+1. Identify goal in plain language.
+2. Identify involved entities, not just devices.
+3. Check current entity IDs through `/api/states` or entity registry.
+4. Decide trigger type.
+5. Decide conditions.
+6. Decide actions.
+7. Decide mode.
+8. Decide reload target.
+9. Write YAML.
+10. Validate.
+11. Reload targeted domain.
+12. Verify traces/logs/state.
+
+### 21.2 Entity discovery
+
+```sh
+curl -fsS -H "Authorization: Bearer $HA_TOKEN" http://127.0.0.1:8123/api/states \
+  | jq -r '.[] | .entity_id' | sort
+```
+
+Search for entities:
+
+```sh
+curl -fsS -H "Authorization: Bearer $HA_TOKEN" http://127.0.0.1:8123/api/states \
+  | jq -r '.[] | select(.entity_id | test("motion|occupancy|presence|light|switch"; "i")) | [.entity_id, .state] | @tsv'
+```
+
+### 21.3 Registry inspection
+
+Read-only:
+
+```sh
+docker exec "$HA_CONT" sh -lc 'python -m json.tool /config/.storage/core.entity_registry >/dev/null && echo entity_registry_json_ok'
+docker exec "$HA_CONT" sh -lc 'python -m json.tool /config/.storage/core.device_registry >/dev/null && echo device_registry_json_ok'
+```
+
+Avoid manually editing registries unless stopped, backed up, and approved.
+
+### 21.4 Automation quality checklist
+
+A good automation has:
+
+- stable `id`
+- readable `alias`
+- useful `description`
+- entity-based triggers
+- clear mode
+- no hardcoded device IDs unless required
+- no brittle delays when waiting for a state/event would be better
+- guard conditions for unavailable/unknown states
+- no unsafe actions without explicit conditions
+- action parameters split into `target` and `data`
+- comments for non-obvious logic
+- minimal scope
+
+---
+
+## 22. Python scripts inside Home Assistant
+
+The `python_script` integration is sandboxed and useful for small dynamic routines. It is not general Python automation.
+
+Enable in `configuration.yaml`:
+
+```yaml
+python_script:
+```
+
+Scripts live in:
+
+```text
+/config/python_scripts/
+```
+
+Example:
+
+```python
+entity_id = data.get("entity_id")
+message = data.get("message", "Python script ran")
+
+if entity_id:
+    logger.info("python_script target: {}".format(entity_id))
+
+output["status"] = "ok"
+output["message"] = message
+```
+
+Reload if service exists:
+
+```sh
+curl -fsS -X POST \
+  -H "Authorization: Bearer $HA_TOKEN" \
+  -H "Content-Type: application/json" \
+  http://127.0.0.1:8123/api/services/python_script/reload \
+  -d '{}'
+```
+
+Rules:
+
+- Do not use `python_script` for complex libraries or arbitrary imports.
+- For complex Python, use AppDaemon, pyscript, a custom integration, or an external service.
+- Do not store secrets in scripts.
+
+---
+
+## 23. Dashboards and Lovelace
+
+Dashboards may be UI-managed in `.storage/lovelace*` or YAML-managed.
+
+Rules:
+
+- Determine whether the dashboard is UI or YAML mode before editing.
+- Prefer UI/API for UI-managed dashboards.
+- Back up `.storage/lovelace*` before manual changes.
+- Validate JSON for `.storage` edits.
+- Avoid large dashboard rewrites unless requested.
+
+---
+
+## 24. Corruption and recovery playbooks
+
+### 24.1 Home Assistant stuck restarting
+
+Collect:
+
+```sh
+docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
+docker logs --tail=500 "$HA_CONT"
+docker inspect "$HA_CONT" --format '{{.State.ExitCode}} {{.State.Error}}'
+df -h
+```
+
+Then check:
+
+- config validation
+- custom integration errors
+- database errors
+- `.storage` JSON errors
+- missing secrets
+- invalid YAML
+- failed migration
+- unavailable mounted config path
+
+Do not repeatedly restart a crash-looping container without reading logs.
+
+### 24.2 YAML/config error
+
+Workflow:
+
+1. Identify file and line from validation/logs.
+2. Restore backup or patch error.
+3. Run `check_config`.
+4. Reload target domain or restart only if required.
+
+### 24.3 `.storage` JSON error
+
+Workflow:
+
+1. Stop before editing.
+2. Back up entire `.storage`.
+3. Validate all JSON.
+4. Identify broken file.
+5. Restore from backup if available.
+6. If no backup, repair JSON minimally.
+7. Start Home Assistant.
+8. Watch logs.
+
+### 24.4 Recorder DB corruption
+
+Workflow:
+
+1. Confirm log evidence.
+2. Back up config.
+3. Stop Home Assistant.
+4. Move DB aside, do not delete.
+5. Start Home Assistant.
+6. Confirm recorder/history behavior.
+7. Report loss/impact.
+
+### 24.5 Custom integration blocks startup
+
+Workflow:
+
+1. Identify exact integration from traceback.
+2. Check current HA version and custom component manifest.
+3. Propose disabling only that integration directory.
+4. Stop HA.
+5. Move directory aside with timestamp.
+6. Start HA.
+7. Confirm system health.
+8. Recommend updating or replacing the integration.
+
+---
+
+## 25. Change workflow
+
+Before any change:
+
+```markdown
+## Proposed Home Assistant Change
+
+Target:
+Install type:
+Observed problem:
+Proposed change:
+Files/containers affected:
+Risk level:
+Backup plan:
+Validation command:
+Reload/restart plan:
+Rollback plan:
+Expected impact:
+Requires approval: yes
+```
+
+After any change:
+
+```markdown
+## Home Assistant Change Result
+
+Target:
+Change performed:
+Files/containers changed:
+Backup created:
+Validation result:
+Reload/restart performed:
+Log review:
+User-visible effect:
+Rollback needed:
+Remaining concerns:
+```
+
+---
+
+## 26. Diagnostic report format
+
+```markdown
+# Home Assistant System Diagnostic Report
+
+## Summary
+- Overall state:
+- Primary issue:
+- Confidence:
+- Immediate action needed:
+
+## Installation
+- Install type:
+- Host:
+- Container:
+- Image:
+- Home Assistant version:
+- Config mount:
+
+## Container / Host
+- Container status:
+- Restart count / crash loop:
+- Disk space:
+- Network mode:
+- Port exposure:
+- Compose file:
+
+## Configuration
+- Config validation:
+- YAML split structure:
+- Secrets handling:
+- `.storage` health:
+- Recorder DB health:
+- Custom integrations:
+
+## Logs
+- Main errors:
+- Warnings:
+- Recent migrations:
+- Repair indicators:
+
+## Integrations / Controllers
+- ZHA:
+- Z-Wave JS:
+- Matter/Thread:
+- MQTT:
+- HACS/custom components:
+
+## Automations / Routines
+- Relevant automations:
+- Scripts/scenes/helpers:
+- Template entities:
+- Reload/restart needed:
+
+## Recommended next steps
+1.
+2.
+3.
+
+## Actions intentionally not taken
+-
+```
+
+---
+
+## 27. What not to do
+
+Never do these as first-line fixes:
+
+```sh
+docker system prune
+docker volume prune
+docker compose down
+rm -rf /config/.storage
+rm -rf /config/custom_components
+rm /config/home-assistant_v2.db
+rm /config/secrets.yaml
+chmod -R 777 /config
+chown -R root:root /config
+```
+
+Never assume:
+
+- container name is `homeassistant`
+- config path is `/opt/homeassistant/config`
+- install is Home Assistant OS
+- Supervisor exists
+- add-ons exist
+- `ha core check` is available
+- `/dev/ttyUSB0` is stable
+- a YAML validation success means all integrations will work
+- restarting fixes radio networks
+- a custom integration is safe after a major HA update
+
+---
+
+## 28. First response pattern
+
+When asked to diagnose Home Assistant:
+
+```text
+I’ll treat this as a Home Assistant system diagnosis, not a live device-control task. I’ll start read-only: identify the install type, container, image/version, config mount, disk space, recent logs, config validation, `.storage` health, recorder DB signals, and the status of related controller containers such as Z-Wave JS, Matter, MQTT, or ESPHome. I won’t edit files, restart containers, update images, or change devices/routines unless you approve the specific change.
+```
+
+When asked to build or modify a routine:
+
+```text
+I’ll inspect the existing Home Assistant config structure first, identify the relevant entities and YAML storage location, make a backup of the target file, write the smallest safe change, run Home Assistant config validation, then use a targeted reload if available instead of restarting the container.
+```
+
+---
+
+## 29. Quick command reference
+
+```sh
+# Discover containers
+docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+
+# HA version
+docker exec homeassistant python -m homeassistant --version
+
+# Config mount
+docker inspect homeassistant --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}'
+
+# Validate config
+docker exec homeassistant python -m homeassistant --script check_config --config /config
+
+# Logs
+docker logs --tail=300 homeassistant
+docker exec homeassistant sh -lc 'tail -n 300 /config/home-assistant.log'
+
+# API health
+curl -fsS -H "Authorization: Bearer $HA_TOKEN" http://127.0.0.1:8123/api/
+
+# List services/actions
+curl -fsS -H "Authorization: Bearer $HA_TOKEN" http://127.0.0.1:8123/api/services
+
+# Reload automations
+curl -fsS -X POST -H "Authorization: Bearer $HA_TOKEN" -H "Content-Type: application/json" \
+  http://127.0.0.1:8123/api/services/automation/reload -d '{}'
+
+# Docker compose update pattern, only after approval/checks
+docker compose pull homeassistant
+docker compose up -d homeassistant
+```
+
+---
+
+## 30. Success criteria
+
+A good Home Assistant system architect agent:
+
+- distinguishes Home Assistant Container from OS/Supervised
+- diagnoses before changing
+- knows where config, logs, `.storage`, recorder DB, and custom integrations live
+- preserves YAML custom tags and split configuration structure
+- backs up before edits
+- runs `check_config` before reload/restart
+- uses targeted reloads when possible
+- treats `.storage`, recorder DB, and radio controllers as high-risk
+- writes modern automation/script/template YAML
+- uses entity IDs over device IDs
+- checks Docker, host, API, and HA logs together
+- reports uncertainty clearly
+- never exposes tokens or secrets
